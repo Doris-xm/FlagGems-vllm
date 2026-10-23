@@ -6,10 +6,10 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.runtime.backend._hygon.ops.triton_scaled_mm import (
-    get_scaled_mm_tile_shape,
-    scaled_mm_kernel,
+from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
+    _get_int8_config as get_int8_config,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import zero_bmm_kernel
 from flaggems_vllm.utils import libentry
 
 MAX_INT32_REDUCTION = (2**31 - 1) // (128 * 128)
@@ -18,55 +18,79 @@ MAX_INT32_REDUCTION = (2**31 - 1) // (128 * 128)
 @libentry()
 @triton.jit
 def bmm_channel_int8_kernel(
-    activation,
-    weight,
-    activation_scale,
-    weight_scale,
-    output,
+    A,
+    W,
+    AS,
+    WS,
+    O,
     M: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
+    SA: tl.constexpr,
+    SW: tl.constexpr,
+    SAS: tl.constexpr,
+    SWS: tl.constexpr,
+    SO: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    ALIGNED: tl.constexpr,
+    TILE_K: tl.constexpr,
+    UNROLL: tl.constexpr = 1,
+    SWAP_AB: tl.constexpr = False,
 ):
     batch = tl.program_id(1).to(tl.int64)
-    if K == 0:
-        rows = tl.program_id(0) // tl.cdiv(N, BLOCK_N) * BLOCK_M + tl.arange(0, BLOCK_M)
-        columns = tl.program_id(0) % tl.cdiv(N, BLOCK_N) * BLOCK_N + tl.arange(
-            0, BLOCK_N
-        )
-        tl.store(
-            output + batch * M * N + rows[:, None] * N + columns[None, :],
-            0.0,
-            (rows[:, None] < M) & (columns[None, :] < N),
-        )
+    pid = tl.program_id(0)
+    nm = tl.cdiv(M, BLOCK_M)
+    nn = tl.cdiv(N, BLOCK_N)
+    group = pid // (GROUP_M * nn)
+    first_m = group * GROUP_M
+    size_m = tl.minimum(nm - first_m, GROUP_M)
+    local = pid % (GROUP_M * nn)
+    pm = first_m + local % size_m
+    pn = local // size_m
+    rm = pm * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pn * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, TILE_K)
+    if (
+        max(M * SA[1] + K * SA[2], K * SW[1] + N * SW[2], M * SO[1] + N * SO[2])
+        >= 2**31
+    ):
+        rm = rm.to(tl.int64)
+        rn = rn.to(tl.int64)
+        rk = rk.to(tl.int64)
+    if SWAP_AB:
+        acc = tl.zeros((BLOCK_N, BLOCK_M), tl.int32)
     else:
-        # Reuse the Hygon scaled-MM body; only batch pointer offsets are added.
-        scaled_mm_kernel(
-            activation + batch * M * K,
-            weight + batch * N * K,
-            activation_scale + batch * M,
-            weight_scale + batch * N,
-            output + batch * M * N,
-            None,
-            M,
-            N,
-            K,
-            K,
-            1,
-            1,
-            K,
-            N,
-            1,
-            tl.int32,
-            False,
-            BLOCK_M,
-            BLOCK_N,
-            BLOCK_K,
-            BLOCK_M,
-            BLOCK_N,
-        )
+        acc = tl.zeros((BLOCK_M, BLOCK_N), tl.int32)
+    for kb in tl.range(
+        tl.cdiv(K, TILE_K),
+        loop_unroll_factor=((K + TILE_K - 1) // TILE_K if K <= 256 else UNROLL),
+    ):
+        kk = kb * TILE_K + rk
+        ap = A + batch * SA[0] + rm[:, None] * SA[1] + kk[None, :] * SA[2]
+        wp = W + batch * SW[0] + kk[:, None] * SW[1] + rn[None, :] * SW[2]
+        if ALIGNED:
+            a = tl.load(ap)
+            w = tl.load(wp)
+        else:
+            a = tl.load(ap, (rm[:, None] < M) & (kk[None, :] < K), other=0)
+            w = tl.load(wp, (kk[:, None] < K) & (rn[None, :] < N), other=0)
+        if SWAP_AB:
+            acc = tl.dot(tl.trans(w), tl.trans(a), acc, out_dtype=tl.int32)
+        else:
+            acc = tl.dot(a, w, acc, out_dtype=tl.int32)
+    if SWAP_AB:
+        acc = tl.trans(acc)
+    a_scale = tl.load(AS + batch * SAS[0] + rm * SAS[1], rm < M, other=0)
+    w_scale = tl.load(WS + batch * SWS[0] + rn * SWS[2], rn < N, other=0)
+    acc = acc.to(tl.float32) * a_scale[:, None]
+    acc = acc * w_scale[None, :]
+    op = O + batch * SO[0] + rm[:, None] * SO[1] + rn[None, :] * SO[2]
+    if ALIGNED:
+        tl.store(op, acc)
+    else:
+        tl.store(op, acc, (rm[:, None] < M) & (rn[None, :] < N))
 
 
 def bmm_w8a8_int8(
@@ -132,8 +156,17 @@ def bmm_w8a8_int8(
         raise ValueError("out must not share storage with an input")
     if out.numel() == 0:
         return out
-    block_m, block_n, block_k = get_scaled_mm_tile_shape(rows, columns)
     with torch_device_fn.device(activation.device):
+        if reduction == 0:
+            zero_bmm_kernel[(triton.cdiv(out.numel(), 256),)](
+                out, out.numel(), rows, columns, out.stride(), BLOCK_SIZE=256
+            )
+            return out
+        config = get_int8_config(batch, rows, columns, reduction)
+        block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
+        block_k = config["TILE_K"] or min(
+            128, max(32, triton.next_power_of_2(reduction))
+        )
         bmm_channel_int8_kernel[
             (triton.cdiv(rows, block_m) * triton.cdiv(columns, block_n), batch)
         ](
@@ -145,10 +178,21 @@ def bmm_w8a8_int8(
             rows,
             columns,
             reduction,
-            block_m,
-            block_n,
-            block_k,
-            num_warps=4,
-            num_stages=1,
+            activation.stride(),
+            weight.stride(),
+            (activation_scale.stride(0), activation_scale.stride(1), 0),
+            (weight_scale.stride(0), 0, weight_scale.stride(-1)),
+            out.stride(),
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            ALIGNED=rows % block_m == 0
+            and columns % block_n == 0
+            and reduction % block_k == 0,
+            TILE_K=block_k,
+            GROUP_M=config["GROUP_M"],
+            UNROLL=config["UNROLL"],
+            SWAP_AB=config["SWAP_AB"],
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
         )
     return out
