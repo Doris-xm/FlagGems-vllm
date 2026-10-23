@@ -174,6 +174,18 @@ def scaled_mm_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+def get_scaled_mm_tile_shape(rows: int, columns: int) -> tuple[int, int, int]:
+    next_power_of_2_rows = max(32, triton.next_power_of_2(rows))
+    if next_power_of_2_rows <= 32:
+        return (64, 64, 256) if columns < 8192 else (64, 128, 256)
+    elif next_power_of_2_rows <= 64:
+        return 64, 64, 256
+    elif next_power_of_2_rows <= 128:
+        return 64, 128, 128
+    else:
+        return 128, 128, 128
+
+
 # input   - [M, K]
 # weight - [K, N]
 def triton_scaled_mm(
@@ -216,18 +228,7 @@ def triton_scaled_mm(
     has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
 
     if use_heuristic:
-        is_small_N = N < 8192
-        next_power_of_2_M = max(32, triton.next_power_of_2(M))
-        if next_power_of_2_M <= 32:
-            tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
-        elif next_power_of_2_M <= 64:
-            tile_shape = (64, 64, 256)
-        elif next_power_of_2_M <= 128:
-            tile_shape = (64, 128, 128)
-        else:
-            tile_shape = (128, 128, 128)
-
-        block_size_m, block_size_n, block_size_k = tile_shape
+        block_size_m, block_size_n, block_size_k = get_scaled_mm_tile_shape(M, N)
 
     # fp8 has no native matrix-core path on DCU, so we upcast the operands to
     # float32 inside the kernel; int8 keeps the native int32-accumulate dot.

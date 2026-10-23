@@ -6,7 +6,10 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.runtime.backend._hygon.ops.triton_scaled_mm import scaled_mm_kernel
+from flaggems_vllm.runtime.backend._hygon.ops.triton_scaled_mm import (
+    get_scaled_mm_tile_shape,
+    scaled_mm_kernel,
+)
 from flaggems_vllm.utils import libentry
 
 MAX_INT32_REDUCTION = (2**31 - 1) // (128 * 128)
@@ -129,7 +132,7 @@ def bmm_w8a8_int8(
         raise ValueError("out must not share storage with an input")
     if out.numel() == 0:
         return out
-    block_m, block_n, block_k = 32, 32, 32
+    block_m, block_n, block_k = get_scaled_mm_tile_shape(rows, columns)
     with torch_device_fn.device(activation.device):
         bmm_channel_int8_kernel[
             (triton.cdiv(rows, block_m) * triton.cdiv(columns, block_n), batch)
