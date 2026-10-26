@@ -6,13 +6,79 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
-    _get_int8_config as get_int8_config,
-)
 from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import zero_bmm_kernel
 from flaggems_vllm.utils import libentry
 
 MAX_INT32_REDUCTION = (2**31 - 1) // (128 * 128)
+
+
+# Hygon DCU, torch 2.9.0 (ROCm, HIP 6.3.26045) / Triton 3.6.0, 2026-10-23.
+# Values: BLOCK_M, BLOCK_N, num_warps, num_stages, GROUP_M, ACC_FP32, SWAP_AB,
+# optionally TILE_K (defaults to min(128, max(32, next_power_of_2(K)))) and UNROLL
+# (K-loop unroll factor for K > 256, defaults to 1).
+EXACT_CONFIGS = {
+    (8, 8, 1024, 4096): (16, 64, 4, 2, 8, False, False, 64, 4),
+    (8, 32, 1024, 4096): (32, 64, 8, 2, 1, False, False, 128, 1),
+}
+
+
+def _get_int8_config(batch, m, n, k, scale_n=128):
+    key = (batch, m, n, k)
+    acc_fp32, swap_ab, tile_k, unroll = False, False, None, 1
+    if key in EXACT_CONFIGS:
+        values = EXACT_CONFIGS[key]
+        bm, bn, warps, stages, group, acc_fp32, swap_ab, tile_k, unroll = (
+            *values,
+            None,
+            1,
+        )[:9]
+    elif n == 1024 and k >= 4096:
+        if batch == 1:
+            if m <= 32:
+                bm, bn, warps, stages, group = 16, 32, 4, 2, 1
+            elif m <= 224:
+                bm, bn, warps, stages, group = 32, 32, 4, 2, 1
+            elif m <= 320:
+                bm, bn, warps, stages, group = 64, 64, 8, 2, 1
+            elif m <= 512:
+                bm, bn, warps, stages, group = 64, 64, 4, 2, 1
+            else:
+                bm, bn, warps, stages, group = 128, 128, 8, 2, 1
+        elif m <= 64:
+            bm = min(64, max(16, triton.next_power_of_2(m)))
+            bn = 64 if k <= 4096 else 128
+            warps = 4 if k <= 4096 else 8
+            stages, group = 2, 1
+            unroll = 2 if k <= 4096 else 1
+        else:
+            bm, bn, stages = 128, 128, 2
+            warps = 8 if k <= 4096 else 4
+            group = 1 if k <= 4096 and m > 128 else 8
+            unroll = 2 if k <= 4096 and m <= 128 else 1
+    elif n >= 2048 and m >= 128:
+        if k <= 256:
+            bm, bn, warps, stages, group = 64, 64, 4, 2, 1
+        else:
+            bm, bn, warps, stages = 128, 128, 4, 2
+            group = 8 if n >= 4096 else 1
+    elif m <= 64:
+        bm, bn, warps, stages, group = 32, 64, 4, 2, 1
+    elif k >= 4096:
+        bm, bn, warps, stages, group = 128, 128, 8, 1, 8
+    else:
+        bm, bn, warps, stages, group = 64, 64, 4, 2, 4
+    result = dict(
+        BLOCK_M=bm,
+        BLOCK_N=min(bn, scale_n),
+        num_warps=warps,
+        num_stages=stages,
+        GROUP_M=group,
+        ACC_FP32=acc_fp32,
+        SWAP_AB=swap_ab,
+        TILE_K=tile_k,
+        UNROLL=unroll,
+    )
+    return result
 
 
 @libentry()
@@ -162,7 +228,7 @@ def bmm_w8a8_int8(
                 out, out.numel(), rows, columns, out.stride(), BLOCK_SIZE=256
             )
             return out
-        config = get_int8_config(batch, rows, columns, reduction)
+        config = _get_int8_config(batch, rows, columns, reduction)
         block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
         block_k = config["TILE_K"] or min(
             128, max(32, triton.next_power_of_2(reduction))
